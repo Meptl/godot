@@ -84,6 +84,7 @@ const char *Image::format_names[Image::FORMAT_MAX] = {
 
 SavePNGFunc Image::save_png_func = nullptr;
 SaveEXRFunc Image::save_exr_func = nullptr;
+SaveWEBPFunc Image::save_webp_func = nullptr;
 
 SavePNGBufferFunc Image::save_png_buffer_func = nullptr;
 
@@ -2078,6 +2079,14 @@ Error Image::save_exr(const String &p_path, bool p_grayscale) const {
 	return save_exr_func(p_path, Ref<Image>((Image *)this), p_grayscale);
 }
 
+Error Image::save_webp(const String &p_path, const float p_quality) const {
+	if (save_webp_func == nullptr) {
+		return ERR_UNAVAILABLE;
+	}
+
+	return save_webp_func(p_path, Ref<Image>((Image *)this), p_quality);
+}
+
 int Image::get_image_data_size(int p_width, int p_height, Format p_format, bool p_mipmaps) {
 	int mm;
 	return _get_dst_image_size(p_width, p_height, p_format, mm, p_mipmaps ? -1 : 0);
@@ -2883,6 +2892,7 @@ void Image::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("save_png", "path"), &Image::save_png);
 	ClassDB::bind_method(D_METHOD("save_png_to_buffer"), &Image::save_png_to_buffer);
 	ClassDB::bind_method(D_METHOD("save_exr", "path", "grayscale"), &Image::save_exr, DEFVAL(false));
+	ClassDB::bind_method(D_METHOD("save_webp", "path"), &Image::save_webp);
 
 	ClassDB::bind_method(D_METHOD("detect_alpha"), &Image::detect_alpha);
 	ClassDB::bind_method(D_METHOD("is_invisible"), &Image::is_invisible);

@@ -40,4 +40,6 @@ public:
 	ImageLoaderWEBP();
 };
 
+Error save_webp(const String &p_path, const Ref<Image> &p_img, const float p_quality);
+
 #endif

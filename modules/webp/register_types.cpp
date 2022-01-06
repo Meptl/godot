@@ -37,8 +37,12 @@ static ImageLoaderWEBP *image_loader_webp = nullptr;
 void register_webp_types() {
 	image_loader_webp = memnew(ImageLoaderWEBP);
 	ImageLoader::add_image_format_loader(image_loader_webp);
+
+	Image::save_webp_func = save_webp;
 }
 
 void unregister_webp_types() {
 	memdelete(image_loader_webp);
+
+	Image::save_webp_func = nullptr;
 }

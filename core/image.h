@@ -51,6 +51,7 @@ typedef PoolVector<uint8_t> (*SavePNGBufferFunc)(const Ref<Image> &p_img);
 typedef Ref<Image> (*ImageMemLoadFunc)(const uint8_t *p_png, int p_size);
 
 typedef Error (*SaveEXRFunc)(const String &p_path, const Ref<Image> &p_img, bool p_grayscale);
+typedef Error (*SaveWEBPFunc)(const String &p_path, const Ref<Image> &p_img, float p_quality);
 
 class Image : public Resource {
 	GDCLASS(Image, Resource);
@@ -58,6 +59,7 @@ class Image : public Resource {
 public:
 	static SavePNGFunc save_png_func;
 	static SaveEXRFunc save_exr_func;
+	static SaveWEBPFunc save_webp_func;
 	static SavePNGBufferFunc save_png_buffer_func;
 
 	enum {
@@ -267,6 +269,7 @@ public:
 	Error save_png(const String &p_path) const;
 	PoolVector<uint8_t> save_png_to_buffer() const;
 	Error save_exr(const String &p_path, bool p_grayscale) const;
+	Error save_webp(const String &p_path, float p_quality) const;
 
 	/**
 	 * create an empty image

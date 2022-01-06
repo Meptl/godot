@@ -236,6 +236,26 @@ void ImageLoaderWEBP::get_recognized_extensions(List<String> *p_extensions) cons
 	p_extensions->push_back("webp");
 }
 
+Error save_webp(const String &p_path, const Ref<Image> &p_img, const float p_quality) {
+	PoolVector<uint8_t> data = _webp_lossy_pack(p_img, p_quality);
+	Error err = OK;
+	FileAccess *file = FileAccess::open(p_path, FileAccess::WRITE, &err);
+	ERR_FAIL_COND_V_MSG(err, err, vformat("Can't save WEBP at path: '%s'.", p_path));
+
+	PoolVector<uint8_t>::Read reader = data.read();
+
+	file->store_buffer(&reader.ptr()[4], data.size() - 4);
+	if (file->get_error() != OK && file->get_error() != ERR_FILE_EOF) {
+		memdelete(file);
+		return ERR_CANT_CREATE;
+	}
+
+	file->close();
+	memdelete(file);
+
+	return OK;
+}
+
 ImageLoaderWEBP::ImageLoaderWEBP() {
 	Image::_webp_mem_loader_func = _webp_mem_loader_func;
 	Image::webp_lossy_packer = _webp_lossy_pack;
