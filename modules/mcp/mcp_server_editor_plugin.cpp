@@ -31,6 +31,7 @@
 #include "mcp_server_editor_plugin.h"
 
 #include "core/config/project_settings.h"
+#include "core/io/dir_access.h"
 #include "core/io/file_access.h"
 #include "core/version.h"
 #include "editor/editor_log.h"
@@ -208,6 +209,27 @@ void MCPServerEditorPlugin::_read_settings() {
 	port = (int)_EDITOR_GET("network/mcp_server/port");
 }
 
+void MCPServerEditorPlugin::_save_discovered_port(int p_port) {
+	const String mcp_port_path = ProjectSettings::get_singleton()->get_project_data_path().path_join("mcp_port");
+
+	if (p_port < 0) {
+		if (FileAccess::exists(mcp_port_path)) {
+			const Error err = DirAccess::remove_absolute(ProjectSettings::get_singleton()->globalize_path(mcp_port_path));
+			if (err != OK) {
+				EditorNode::get_log()->add_message(vformat("Cannot remove MCP port file %s.", mcp_port_path), EditorLog::MSG_TYPE_WARNING);
+			}
+		}
+		return;
+	}
+
+	Ref<FileAccess> f = FileAccess::open(mcp_port_path, FileAccess::WRITE);
+	if (f.is_null()) {
+		EditorNode::get_log()->add_message(vformat("Cannot write MCP port file %s.", mcp_port_path), EditorLog::MSG_TYPE_WARNING);
+		return;
+	}
+	f->store_string(itos(p_port));
+}
+
 void MCPServerEditorPlugin::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_EXIT_TREE: {
@@ -247,38 +269,54 @@ void MCPServerEditorPlugin::start() {
 		return;
 	}
 
-	mcp::server::configuration config;
-	config.host = host.utf8().get_data();
-	config.port = port;
-	config.name = "Godot MCP Server";
-	config.version = VERSION_FULL_CONFIG;
-	config.http_endpoint = "/";
+	int bind_port = port;
+	const int max_attempts = 5;
+	for (int attempt = 1;; ++attempt) {
+		mcp::server::configuration config;
+		config.host = host.utf8().get_data();
+		config.port = bind_port;
+		config.name = "Godot MCP Server";
+		config.version = VERSION_FULL_CONFIG;
+		config.http_endpoint = "/";
 
-	server = new mcp::server(config);
-	server->set_server_info(config.name, config.version);
-	server->set_capabilities({
-			{"tools", mcp::json::object()},
-	});
+		server = new mcp::server(config);
+		server->set_server_info(config.name, config.version);
+		server->set_capabilities({
+				{"tools", mcp::json::object()},
+		});
 
-	mcp::tool echo_tool = mcp::tool_builder("echo")
-			.with_description("Echoes the provided message.")
-			.with_string_param("message", "Message to echo back.", false)
-			.build();
-	server->register_tool(echo_tool, _echo_tool_handler);
+		mcp::tool echo_tool = mcp::tool_builder("echo")
+				.with_description("Echoes the provided message.")
+				.with_string_param("message", "Message to echo back.", false)
+				.build();
+		server->register_tool(echo_tool, _echo_tool_handler);
 
-	mcp::tool check_script_tool = mcp::tool_builder("check_script")
-			.with_description("Validates a GDScript file and returns diagnostics similar to editor/LSP output.")
-			.with_string_param("path", "Path to the script file. Supports res:// and filesystem paths.", true)
-			.with_boolean_param("include_warnings", "Include parser/analyzer warnings in the output.", false)
-			.build();
-	server->register_tool(check_script_tool, _check_script_tool_handler);
+		mcp::tool check_script_tool = mcp::tool_builder("check_script")
+				.with_description("Validates a GDScript file and returns diagnostics similar to editor/LSP output.")
+				.with_string_param("path", "Path to the script file. Supports res:// and filesystem paths.", true)
+				.with_boolean_param("include_warnings", "Include parser/analyzer warnings in the output.", false)
+				.build();
+		server->register_tool(check_script_tool, _check_script_tool_handler);
 
-	if (server->start(false)) {
-		started = true;
-		EditorNode::get_log()->add_message(vformat("--- MCP server started on %s:%d ---", host, port), EditorLog::MSG_TYPE_EDITOR);
-	} else {
+		if (server->start(false)) {
+			started = true;
+			bound_port = bind_port;
+			_save_discovered_port(bound_port);
+			EditorNode::get_log()->add_message(vformat("--- MCP server started on %s:%d ---", host, bound_port), EditorLog::MSG_TYPE_EDITOR);
+			break;
+		}
+
 		delete server;
 		server = nullptr;
+
+		if (attempt >= max_attempts) {
+			_save_discovered_port(-1);
+			EditorNode::get_log()->add_message(vformat("Cannot listen on port %d, MCP server unavailable.", bind_port), EditorLog::MSG_TYPE_ERROR);
+			break;
+		}
+
+		int last_port = bind_port++;
+		EditorNode::get_log()->add_message(vformat("Cannot listen on port %d, trying %d instead.", last_port, bind_port), EditorLog::MSG_TYPE_WARNING);
 	}
 }
 
@@ -293,5 +331,7 @@ void MCPServerEditorPlugin::stop() {
 	delete server;
 	server = nullptr;
 	started = false;
+	bound_port = -1;
+	_save_discovered_port(-1);
 	EditorNode::get_log()->add_message("--- MCP server stopped ---", EditorLog::MSG_TYPE_EDITOR);
 }

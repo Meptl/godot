@@ -45,9 +45,11 @@ class MCPServerEditorPlugin : public EditorPlugin {
 	bool enabled = true;
 	String host = "127.0.0.1";
 	int port = 8927;
+	int bound_port = -1;
 
 	void _notification(int p_what);
 	void _read_settings();
+	void _save_discovered_port(int p_port);
 
 public:
 	MCPServerEditorPlugin();
