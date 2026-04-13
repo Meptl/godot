@@ -1,0 +1,41 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+Import("env")
+Import("env_modules")
+
+env_mcp_module = env_modules.Clone()
+env_mcp_module.add_source_files(env.modules_sources, "register_types.cpp")
+
+if env.editor_build:
+    # cpp-mcp uses C++ exceptions, which are disabled globally in default MSVC builds.
+    # Keep the integration disabled there until per-module exception handling is set up.
+    if not (env.msvc and env["disable_exceptions"]):
+        env_mcp_plugin = env_mcp_module.Clone()
+        env_mcp_plugin.Prepend(CPPPATH=["#thirdparty/cpp-mcp/include", "#thirdparty/cpp-mcp/common"])
+        if env["disable_exceptions"] and not env.msvc:
+            env_mcp_plugin.Append(CXXFLAGS=["-fexceptions"])
+        env_mcp_plugin.add_source_files(env.modules_sources, "mcp_server_editor_plugin.cpp")
+
+        thirdparty_obj = []
+        thirdparty_dir = "#thirdparty/cpp-mcp/src/"
+        thirdparty_sources = [
+            "mcp_message.cpp",
+            "mcp_resource.cpp",
+            "mcp_server.cpp",
+            "mcp_tool.cpp",
+            "mcp_stdio_client.cpp",
+            "mcp_sse_client.cpp",
+        ]
+        thirdparty_sources = [thirdparty_dir + file for file in thirdparty_sources]
+
+        env_mcp_thirdparty = env_mcp_module.Clone()
+        env_mcp_thirdparty.disable_warnings()
+        env_mcp_thirdparty.Prepend(CPPPATH=["#thirdparty/cpp-mcp/include", "#thirdparty/cpp-mcp/common"])
+        if env["disable_exceptions"] and not env.msvc:
+            env_mcp_thirdparty.Append(CXXFLAGS=["-fexceptions"])
+        env_mcp_thirdparty.add_source_files(thirdparty_obj, thirdparty_sources)
+        env.modules_sources += thirdparty_obj
+    else:
+        env_mcp_module.Append(CPPDEFINES=["MCP_NO_SERVER"])
+        env.Append(CPPDEFINES=["MCP_NO_SERVER"])

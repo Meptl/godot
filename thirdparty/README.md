@@ -134,6 +134,18 @@ Patches:
 - `0002-llvm-21-header.patch` ([GH-113850](https://github.com/godotengine/godot/pull/113850))
 
 
+## cpp-mcp
+
+- Upstream: https://github.com/hkr04/cpp-mcp
+- Version: git (b1a4467f15920fea9441a4886735530f8b05abc5, 2026-04-01)
+- License: MIT
+
+Files extracted from upstream source:
+
+- `common/`, `include/`, and `src/` folders
+- `LICENSE`
+
+
 ## cvtt
 
 - Upstream: https://github.com/elasota/ConvectionKernels
