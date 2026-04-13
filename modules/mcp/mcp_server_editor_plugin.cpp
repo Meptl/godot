@@ -38,6 +38,7 @@
 #include "editor/editor_log.h"
 #include "editor/editor_node.h"
 #include "editor/settings/editor_settings.h"
+#include "modules/modules_enabled.gen.h"
 #include "mcp_server.h"
 #include "mcp_tool.h"
 #ifdef MODULE_GDSCRIPT_ENABLED
@@ -195,6 +196,32 @@ static mcp::json _check_script_tool_handler(const mcp::json &p_params, const std
 	};
 #endif
 }
+
+#ifdef TESTS_ENABLED
+Dictionary mcp_check_script_tool_handler_for_tests(const String &p_path, bool p_include_warnings) {
+	Dictionary result;
+	mcp::json params;
+	params["path"] = p_path.utf8().get_data();
+	params["include_warnings"] = p_include_warnings;
+
+	try {
+		const mcp::json response = _check_script_tool_handler(params, "");
+		if (!response.is_array() || response.empty() || !response[0].contains("text") || !response[0]["text"].is_string()) {
+			result["threw"] = true;
+			result["error"] = "Unexpected MCP check_script response format";
+			return result;
+		}
+
+		result["threw"] = false;
+		result["json_text"] = String::utf8(response[0]["text"].get<std::string>().c_str());
+		return result;
+	} catch (const std::runtime_error &e) {
+		result["threw"] = true;
+		result["error"] = String::utf8(e.what());
+		return result;
+	}
+}
+#endif // TESTS_ENABLED
 
 MCPServerEditorPlugin::MCPServerEditorPlugin() {
 	_EDITOR_DEF("network/mcp_server/enable", enabled);

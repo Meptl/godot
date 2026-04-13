@@ -36,6 +36,12 @@ if env.editor_build:
             env_mcp_thirdparty.Append(CXXFLAGS=["-fexceptions"])
         env_mcp_thirdparty.add_source_files(thirdparty_obj, thirdparty_sources)
         env.modules_sources += thirdparty_obj
+
+        if env["tests"]:
+            env_mcp_plugin.Append(CPPDEFINES=["TESTS_ENABLED"])
+            env_mcp_plugin.add_source_files(env.modules_sources, "./tests/*.cpp")
+            if env["disable_exceptions"] and not env.msvc:
+                env_mcp_plugin.Append(CPPDEFINES=["DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS"])
     else:
         env_mcp_module.Append(CPPDEFINES=["MCP_NO_SERVER"])
         env.Append(CPPDEFINES=["MCP_NO_SERVER"])
