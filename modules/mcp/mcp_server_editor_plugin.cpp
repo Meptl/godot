@@ -109,6 +109,7 @@ void MCPServerEditorPlugin::start() {
 	config.port = port;
 	config.name = "Godot MCP Server";
 	config.version = VERSION_FULL_CONFIG;
+	config.http_endpoint = "/";
 
 	server = new mcp::server(config);
 	server->set_server_info(config.name, config.version);
