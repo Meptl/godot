@@ -33,6 +33,7 @@
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/string/print_string.h"
 #include "core/version.h"
 #include "editor/editor_log.h"
 #include "editor/editor_node.h"
@@ -302,7 +303,9 @@ void MCPServerEditorPlugin::start() {
 			started = true;
 			bound_port = bind_port;
 			_save_discovered_port(bound_port);
-			EditorNode::get_log()->add_message(vformat("--- MCP server started on %s:%d ---", host, bound_port), EditorLog::MSG_TYPE_EDITOR);
+			const String started_msg = vformat("--- MCP server started on %s:%d ---", host, bound_port);
+			EditorNode::get_log()->add_message(started_msg, EditorLog::MSG_TYPE_EDITOR);
+			print_line(started_msg);
 			break;
 		}
 
@@ -311,12 +314,16 @@ void MCPServerEditorPlugin::start() {
 
 		if (attempt >= max_attempts) {
 			_save_discovered_port(-1);
-			EditorNode::get_log()->add_message(vformat("Cannot listen on port %d, MCP server unavailable.", bind_port), EditorLog::MSG_TYPE_ERROR);
+			const String err_msg = vformat("Cannot listen on port %d, MCP server unavailable.", bind_port);
+			EditorNode::get_log()->add_message(err_msg, EditorLog::MSG_TYPE_ERROR);
+			print_line(err_msg);
 			break;
 		}
 
 		int last_port = bind_port++;
-		EditorNode::get_log()->add_message(vformat("Cannot listen on port %d, trying %d instead.", last_port, bind_port), EditorLog::MSG_TYPE_WARNING);
+		const String retry_msg = vformat("Cannot listen on port %d, trying %d instead.", last_port, bind_port);
+		EditorNode::get_log()->add_message(retry_msg, EditorLog::MSG_TYPE_WARNING);
+		print_line(retry_msg);
 	}
 }
 
