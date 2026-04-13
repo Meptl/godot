@@ -30,12 +30,18 @@
 
 #include "mcp_server_editor_plugin.h"
 
+#include "core/config/project_settings.h"
+#include "core/io/file_access.h"
 #include "core/version.h"
 #include "editor/editor_log.h"
 #include "editor/editor_node.h"
 #include "editor/settings/editor_settings.h"
 #include "mcp_server.h"
 #include "mcp_tool.h"
+#ifdef MODULE_GDSCRIPT_ENABLED
+#include "core/object/script_language.h"
+#include "modules/gdscript/gdscript.h"
+#endif
 
 static mcp::json _echo_tool_handler(const mcp::json &p_params, const std::string &) {
 	std::string echo = "pong";
@@ -49,6 +55,143 @@ static mcp::json _echo_tool_handler(const mcp::json &p_params, const std::string
 			{"text", echo},
 		},
 	};
+}
+
+#ifdef MODULE_GDSCRIPT_ENABLED
+static String _resolve_script_path(const String &p_path) {
+	String path = p_path.strip_edges();
+	if (path.is_empty()) {
+		return path;
+	}
+
+	if (!path.begins_with("res://") && !path.begins_with("user://") && path.is_relative_path()) {
+		path = "res://" + path;
+	}
+
+	const String localized = ProjectSettings::get_singleton()->localize_path(path);
+	if (localized.begins_with("res://")) {
+		path = localized;
+	}
+
+	return path;
+}
+
+static mcp::json _make_diagnostic(const String &p_path, const String &p_message, const String &p_source, int p_severity, int p_code, int p_line, int p_column, int p_end_line, int p_end_column) {
+	mcp::json diagnostic;
+	diagnostic["severity"] = p_severity;
+	diagnostic["source"] = p_source.utf8().get_data();
+	diagnostic["message"] = p_message.utf8().get_data();
+	diagnostic["path"] = p_path.utf8().get_data();
+	if (p_code >= 0) {
+		diagnostic["code"] = p_code;
+	}
+	diagnostic["range"] = {
+		{ "start", { { "line", p_line }, { "character", p_column } } },
+		{ "end", { { "line", p_end_line }, { "character", p_end_column } } },
+	};
+	return diagnostic;
+}
+#endif
+
+static mcp::json _check_script_tool_handler(const mcp::json &p_params, const std::string &) {
+	if (!p_params.contains("path") || !p_params["path"].is_string()) {
+		throw std::runtime_error("Missing required string parameter: path");
+	}
+
+#ifndef MODULE_GDSCRIPT_ENABLED
+	return {
+		{
+			{"type", "text"},
+			{"text", R"({"ok":false,"error":"GDScript module is disabled in this build."})"},
+		},
+	};
+#else
+	bool include_warnings = true;
+	if (p_params.contains("include_warnings") && p_params["include_warnings"].is_boolean()) {
+		include_warnings = p_params["include_warnings"].get<bool>();
+	}
+
+	const String input_path = String::utf8(p_params["path"].get<std::string>().c_str());
+	const String script_path = _resolve_script_path(input_path);
+	if (script_path.is_empty()) {
+		throw std::runtime_error("Parameter 'path' must not be empty");
+	}
+
+	Error read_err = OK;
+	const String source = FileAccess::get_file_as_string(script_path, &read_err);
+	if (read_err != OK) {
+		throw std::runtime_error(vformat("Failed to read script '%s' (error %d).", script_path, read_err).utf8().get_data());
+	}
+
+	const GDScriptLanguage *gdscript_language = GDScriptLanguage::get_singleton();
+	if (gdscript_language == nullptr) {
+		throw std::runtime_error("GDScript language singleton is not available");
+	}
+
+	List<ScriptLanguage::ScriptError> errors;
+	List<ScriptLanguage::Warning> warnings;
+	gdscript_language->validate(source, script_path, nullptr, &errors, &warnings, nullptr);
+
+	const PackedStringArray source_lines = source.split("\n", false);
+	auto get_line_end_column = [&source_lines](int p_line) -> int {
+		if (p_line < 0 || p_line >= source_lines.size()) {
+			return 0;
+		}
+
+		const String line_text = source_lines[p_line];
+		return line_text.strip_edges(false).length();
+	};
+
+	mcp::json diagnostics = mcp::json::array();
+
+	for (const ScriptLanguage::ScriptError &error : errors) {
+		const String error_path = error.path.is_empty() ? script_path : error.path;
+		const int line = MAX(0, error.line - 1);
+		const int column = MAX(0, error.column - 1);
+		diagnostics.push_back(_make_diagnostic(
+				error_path,
+				error.message,
+				"gdscript",
+				1,
+				-1,
+				line,
+				column,
+				line,
+				MAX(column, get_line_end_column(line))));
+	}
+
+	if (include_warnings) {
+		for (const ScriptLanguage::Warning &warning : warnings) {
+			const int line = MAX(0, warning.start_line - 1);
+			const int end_line = MAX(line, warning.end_line - 1);
+			const int end_column = (line == end_line) ? get_line_end_column(line) : get_line_end_column(end_line);
+			diagnostics.push_back(_make_diagnostic(
+					script_path,
+					vformat("(%s): %s", warning.string_code, warning.message),
+					"gdscript",
+					2,
+					warning.code,
+					line,
+					0,
+					end_line,
+					end_column));
+		}
+	}
+
+	mcp::json result;
+	result["ok"] = true;
+	result["path"] = script_path.utf8().get_data();
+	result["diagnostics"] = diagnostics;
+	result["error_count"] = errors.size();
+	result["warning_count"] = include_warnings ? warnings.size() : 0;
+
+	return {
+		{
+			{"type", "text"},
+			{"text", result.dump()},
+		},
+	};
+#endif
 }
 
 MCPServerEditorPlugin::MCPServerEditorPlugin() {
@@ -122,6 +265,13 @@ void MCPServerEditorPlugin::start() {
 			.with_string_param("message", "Message to echo back.", false)
 			.build();
 	server->register_tool(echo_tool, _echo_tool_handler);
+
+	mcp::tool check_script_tool = mcp::tool_builder("check_script")
+			.with_description("Validates a GDScript file and returns diagnostics similar to editor/LSP output.")
+			.with_string_param("path", "Path to the script file. Supports res:// and filesystem paths.", true)
+			.with_boolean_param("include_warnings", "Include parser/analyzer warnings in the output.", false)
+			.build();
+	server->register_tool(check_script_tool, _check_script_tool_handler);
 
 	if (server->start(false)) {
 		started = true;
