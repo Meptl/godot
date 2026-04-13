@@ -1,4 +1,5 @@
 # Development
+We're developing modules/mcp which adds mcp capabilities to the Godot game engine.
 
 ## Compiling
 Please use this command:
