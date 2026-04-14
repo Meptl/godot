@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include "core/os/mutex.h"
+#include "core/templates/hash_map.h"
 #include "editor/plugins/editor_plugin.h"
 
 namespace mcp {
@@ -47,9 +49,33 @@ class MCPServerEditorPlugin : public EditorPlugin {
 	int port = 8927;
 	int bound_port = -1;
 
+	struct LaunchRecord {
+		int64_t launch_id = 0;
+		bool launch_requested = false;
+		bool launch_completed = false;
+		bool launch_succeeded = false;
+		bool closed = false;
+		bool closed_by_timeout = false;
+		bool launched_headless = false;
+		int timeout_sec = 15;
+		int64_t timeout_deadline_msec = -1;
+		String error;
+		String scene_path;
+		String debugger_uri;
+		int64_t process_id = -1;
+	};
+
+	Mutex launch_records_mutex;
+	HashMap<int64_t, LaunchRecord> launch_records;
+	int64_t next_launch_id = 1;
+	int64_t active_launch_id = -1;
+
 	void _notification(int p_what);
 	void _read_settings();
 	void _save_discovered_port(int p_port);
+	void _perform_launch_main_scene(int64_t p_launch_id, int p_timeout_sec, int p_headless_mode);
+	void _perform_close_scene_launch(int64_t p_launch_id, bool p_timed_out);
+	void _process_launch_timeouts();
 
 public:
 	MCPServerEditorPlugin();

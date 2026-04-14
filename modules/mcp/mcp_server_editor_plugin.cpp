@@ -35,6 +35,7 @@
 #include "core/io/file_access.h"
 #include "core/object/message_queue.h"
 #include "core/os/mutex.h"
+#include "core/os/os.h"
 #include "core/os/semaphore.h"
 #include "core/os/thread.h"
 #include "core/string/print_string.h"
@@ -42,13 +43,18 @@
 #include "editor/editor_log.h"
 #include "editor/editor_main_screen.h"
 #include "editor/editor_node.h"
+#include "editor/debugger/script_editor_debugger.h"
 #include "editor/file_system/editor_paths.h"
 #include "editor/scene/3d/node_3d_editor_plugin.h"
 #include "editor/scene/canvas_item_editor_plugin.h"
 #include "editor/settings/editor_settings.h"
+#include "editor/debugger/editor_debugger_node.h"
+#include "editor/run/editor_run_bar.h"
 #include "modules/modules_enabled.gen.h"
 #include "mcp_server.h"
 #include "mcp_tool.h"
+#include "scene/debugger/scene_debugger.h"
+#include "servers/display/display_server.h"
 #ifdef MODULE_GDSCRIPT_ENABLED
 #include "core/object/script_language.h"
 #include "modules/gdscript/gdscript.h"
@@ -409,6 +415,136 @@ static mcp::json _screenshot_viewport_tool_handler(const mcp::json &p_params, co
 	};
 }
 
+static mcp::json _make_text_result(const mcp::json &p_result) {
+	return {
+		{
+			{"type", "text"},
+			{"text", p_result.dump()},
+		},
+	};
+}
+
+static mcp::json _serialize_remote_scene_tree(const SceneDebuggerTree *p_tree) {
+	mcp::json nodes = mcp::json::array();
+	if (p_tree == nullptr) {
+		return nodes;
+	}
+
+	Vector<int> remaining_children_stack;
+	Vector<int> parent_index_stack;
+	int node_index = 0;
+	for (const SceneDebuggerTree::RemoteNode &node : p_tree->nodes) {
+		while (!remaining_children_stack.is_empty() && remaining_children_stack[remaining_children_stack.size() - 1] == 0) {
+			remaining_children_stack.resize(remaining_children_stack.size() - 1);
+			parent_index_stack.resize(parent_index_stack.size() - 1);
+		}
+
+		const int parent_index = parent_index_stack.is_empty() ? -1 : parent_index_stack[parent_index_stack.size() - 1];
+		const int depth = remaining_children_stack.size();
+		if (!remaining_children_stack.is_empty()) {
+			remaining_children_stack.write[remaining_children_stack.size() - 1] -= 1;
+		}
+
+		mcp::json node_json;
+		node_json["index"] = node_index;
+		node_json["parent_index"] = parent_index;
+		node_json["depth"] = depth;
+		node_json["child_count"] = node.child_count;
+		node_json["name"] = node.name.utf8().get_data();
+		node_json["type"] = node.type_name.utf8().get_data();
+		node_json["object_id"] = (uint64_t)node.id;
+		node_json["scene_file_path"] = node.scene_file_path.utf8().get_data();
+		node_json["view"] = {
+			{ "has_visible_method", (node.view_flags & SceneDebuggerTree::RemoteNode::VIEW_HAS_VISIBLE_METHOD) != 0 },
+			{ "visible", (node.view_flags & SceneDebuggerTree::RemoteNode::VIEW_VISIBLE) != 0 },
+			{ "visible_in_tree", (node.view_flags & SceneDebuggerTree::RemoteNode::VIEW_VISIBLE_IN_TREE) != 0 },
+		};
+		nodes.push_back(node_json);
+
+		remaining_children_stack.push_back(node.child_count);
+		parent_index_stack.push_back(node_index);
+		node_index++;
+	}
+
+	return nodes;
+}
+
+static mcp::json _read_remote_scene_tree_main_thread(String &r_error) {
+	ERR_FAIL_COND_V_MSG(!Thread::is_main_thread(), mcp::json::object(), "Remote scene tree read must run on the main thread.");
+
+	EditorDebuggerNode *debugger_node = EditorDebuggerNode::get_singleton();
+	if (debugger_node == nullptr) {
+		r_error = "Editor debugger is unavailable";
+		return mcp::json::object();
+	}
+
+	ScriptEditorDebugger *debugger = debugger_node->get_current_debugger();
+	if (debugger == nullptr) {
+		r_error = "No debugger session is available";
+		return mcp::json::object();
+	}
+	if (!debugger->is_session_active()) {
+		r_error = "No active remote debugger session";
+		return mcp::json::object();
+	}
+
+	debugger->request_remote_tree();
+
+	const SceneDebuggerTree *tree = debugger->get_remote_tree();
+
+	mcp::json result;
+	result["debugger_pid"] = (int64_t)debugger->get_remote_pid();
+	result["node_count"] = tree != nullptr ? tree->nodes.size() : 0;
+	result["nodes"] = _serialize_remote_scene_tree(tree);
+	return result;
+}
+
+static Mutex _remote_scene_tree_capture_mutex;
+static Semaphore _remote_scene_tree_capture_semaphore;
+static String _remote_scene_tree_capture_error;
+static mcp::json _remote_scene_tree_capture_result = mcp::json::object();
+
+static void _capture_remote_scene_tree_deferred() {
+	_remote_scene_tree_capture_error = String();
+	_remote_scene_tree_capture_result = _read_remote_scene_tree_main_thread(_remote_scene_tree_capture_error);
+	_remote_scene_tree_capture_semaphore.post();
+}
+
+static mcp::json _read_remote_scene_tree_thread_safe(String &r_error) {
+	if (Thread::is_main_thread()) {
+		return _read_remote_scene_tree_main_thread(r_error);
+	}
+
+	MutexLock lock(_remote_scene_tree_capture_mutex);
+
+	CallQueue *main_message_queue = MessageQueue::get_main_singleton();
+	if (main_message_queue == nullptr) {
+		r_error = "Main message queue is unavailable";
+		return mcp::json::object();
+	}
+
+	main_message_queue->push_callable(callable_mp_static(&_capture_remote_scene_tree_deferred));
+	_remote_scene_tree_capture_semaphore.wait();
+
+	r_error = _remote_scene_tree_capture_error;
+	return _remote_scene_tree_capture_result;
+}
+
+static mcp::json _get_remote_scene_tree_tool_handler(const mcp::json &p_params, const std::string &) {
+	(void)p_params;
+
+	String error;
+	const mcp::json tree_data = _read_remote_scene_tree_thread_safe(error);
+	if (!error.is_empty()) {
+		throw std::runtime_error(error.utf8().get_data());
+	}
+
+	mcp::json result;
+	result["ok"] = true;
+	result["tree"] = tree_data;
+	return _make_text_result(result);
+}
+
 #ifdef TESTS_ENABLED
 Dictionary mcp_check_script_tool_handler_for_tests(const String &p_path, bool p_include_warnings) {
 	Dictionary result;
@@ -477,6 +613,101 @@ void MCPServerEditorPlugin::_save_discovered_port(int p_port) {
 	f->store_string(itos(p_port));
 }
 
+void MCPServerEditorPlugin::_perform_launch_main_scene(int64_t p_launch_id, int p_timeout_sec, int p_headless_mode) {
+	LaunchRecord updated_record;
+	updated_record.launch_id = p_launch_id;
+	updated_record.launch_requested = true;
+	updated_record.launch_completed = true;
+	updated_record.timeout_sec = p_timeout_sec;
+
+	EditorRunBar *run_bar = EditorRunBar::get_singleton();
+	EditorDebuggerNode *debugger = EditorDebuggerNode::get_singleton();
+
+	if (run_bar == nullptr || debugger == nullptr) {
+		updated_record.launch_succeeded = false;
+		updated_record.error = "Editor run/debug interfaces are unavailable.";
+	} else {
+		const bool launch_headless = (p_headless_mode < 0) ? (DisplayServer::get_singleton()->get_name() == "headless") : (p_headless_mode == 1);
+		updated_record.launched_headless = launch_headless;
+
+		Vector<String> launch_args;
+		if (launch_headless) {
+			launch_args.push_back("--headless");
+		}
+		run_bar->play_main_scene(false, launch_args);
+
+		updated_record.launch_succeeded = run_bar->is_playing();
+		updated_record.scene_path = run_bar->get_playing_scene();
+		updated_record.process_id = (int64_t)run_bar->get_current_process();
+		updated_record.debugger_uri = debugger->get_server_uri();
+		updated_record.closed = !updated_record.launch_succeeded;
+		if (updated_record.launch_succeeded && p_timeout_sec > 0) {
+			updated_record.timeout_deadline_msec = OS::get_singleton()->get_ticks_msec() + ((int64_t)p_timeout_sec * 1000);
+		}
+		if (!updated_record.launch_succeeded) {
+			updated_record.error = "Main scene did not start. Check editor output for details.";
+		}
+	}
+
+	MutexLock lock(launch_records_mutex);
+	if (updated_record.launch_succeeded && active_launch_id >= 0 && launch_records.has(active_launch_id) && !launch_records[active_launch_id].closed) {
+		launch_records[active_launch_id].closed = true;
+	}
+	launch_records[p_launch_id] = updated_record;
+	active_launch_id = updated_record.launch_succeeded ? p_launch_id : -1;
+}
+
+void MCPServerEditorPlugin::_perform_close_scene_launch(int64_t p_launch_id, bool p_timed_out) {
+	EditorRunBar *run_bar = EditorRunBar::get_singleton();
+	if (run_bar != nullptr && run_bar->is_playing()) {
+		run_bar->stop_playing();
+	}
+
+	MutexLock lock(launch_records_mutex);
+	const int64_t target_launch_id = p_launch_id >= 0 ? p_launch_id : active_launch_id;
+	if (target_launch_id >= 0 && launch_records.has(target_launch_id)) {
+		LaunchRecord &record = launch_records[target_launch_id];
+		record.closed = true;
+		record.closed_by_timeout = p_timed_out;
+	}
+	if (target_launch_id == active_launch_id) {
+		active_launch_id = -1;
+	}
+}
+
+void MCPServerEditorPlugin::_process_launch_timeouts() {
+	EditorRunBar *run_bar = EditorRunBar::get_singleton();
+	if (run_bar != nullptr && !run_bar->is_playing()) {
+		MutexLock lock(launch_records_mutex);
+		if (active_launch_id >= 0 && launch_records.has(active_launch_id) && !launch_records[active_launch_id].closed) {
+			launch_records[active_launch_id].closed = true;
+		}
+		active_launch_id = -1;
+		return;
+	}
+
+	int64_t launch_id_to_close = -1;
+	{
+		MutexLock lock(launch_records_mutex);
+		if (active_launch_id < 0 || !launch_records.has(active_launch_id)) {
+			return;
+		}
+
+		const LaunchRecord &record = launch_records[active_launch_id];
+		if (!record.launch_succeeded || record.closed || record.timeout_sec <= 0 || record.timeout_deadline_msec < 0) {
+			return;
+		}
+
+		if (OS::get_singleton()->get_ticks_msec() >= record.timeout_deadline_msec) {
+			launch_id_to_close = active_launch_id;
+		}
+	}
+
+	if (launch_id_to_close >= 0) {
+		_perform_close_scene_launch(launch_id_to_close, true);
+	}
+}
+
 void MCPServerEditorPlugin::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_EXIT_TREE: {
@@ -487,6 +718,7 @@ void MCPServerEditorPlugin::_notification(int p_what) {
 				start_attempted = true;
 				start();
 			}
+			_process_launch_timeouts();
 		} break;
 		case EditorSettings::NOTIFICATION_EDITOR_SETTINGS_CHANGED: {
 			if (!EditorSettings::get_singleton()->check_changed_settings_in_group("network/mcp_server")) {
@@ -551,6 +783,142 @@ void MCPServerEditorPlugin::start() {
 				.with_string_param("viewport", "Viewport target: '2d', '3d', or 'current' (default).", false)
 				.build();
 		server->register_tool(screenshot_viewport_tool, _screenshot_viewport_tool_handler);
+
+		mcp::tool get_remote_scene_tree_tool = mcp::tool_builder("get_remote_scene_tree")
+				.with_description("Returns a snapshot of the active remote debugger scene tree. Always requests a refresh before reading.")
+				.build();
+		server->register_tool(get_remote_scene_tree_tool, _get_remote_scene_tree_tool_handler);
+
+		mcp::tool launch_main_scene_tool = mcp::tool_builder("launch_main_scene")
+				.with_description("Launches the project's main scene (equivalent to pressing F5 in the editor). Mirrors headless mode from the editor process.")
+				.with_number_param("timeout_sec", "Auto-close timeout in seconds (default 15). Set to 0 to disable auto-close.", false)
+				.with_boolean_param("headless", "Optional override for headless launch mode. If omitted, mirrors editor mode.", false)
+				.build();
+		server->register_tool(launch_main_scene_tool, [this](const mcp::json &p_params, const std::string &p_session_id) -> mcp::json {
+			(void)p_session_id;
+
+			int timeout_sec = 15;
+			if (p_params.contains("timeout_sec")) {
+				if (!p_params["timeout_sec"].is_number_integer()) {
+					throw std::runtime_error("Parameter 'timeout_sec' must be an integer");
+				}
+				timeout_sec = p_params["timeout_sec"].get<int>();
+			}
+			if (timeout_sec < 0) {
+				throw std::runtime_error("Parameter 'timeout_sec' must be >= 0");
+			}
+
+			int headless_mode = -1;
+			if (p_params.contains("headless")) {
+				if (!p_params["headless"].is_boolean()) {
+					throw std::runtime_error("Parameter 'headless' must be a boolean");
+				}
+				headless_mode = p_params["headless"].get<bool>() ? 1 : 0;
+			}
+
+			int64_t launch_id = -1;
+			{
+				MutexLock lock(launch_records_mutex);
+				launch_id = next_launch_id++;
+				LaunchRecord record;
+				record.launch_id = launch_id;
+				record.launch_requested = true;
+				record.timeout_sec = timeout_sec;
+				launch_records[launch_id] = record;
+			}
+
+			callable_mp(this, &MCPServerEditorPlugin::_perform_launch_main_scene).call_deferred(launch_id, timeout_sec, headless_mode);
+
+			mcp::json result;
+			result["ok"] = true;
+			result["launch_id"] = launch_id;
+			result["status"] = "queued";
+			result["timeout_sec"] = timeout_sec;
+			if (headless_mode >= 0) {
+				result["headless"] = headless_mode == 1;
+			}
+			result["message"] = "Main scene launch request queued.";
+			return _make_text_result(result);
+		});
+
+		mcp::tool close_scene_launch_tool = mcp::tool_builder("close_scene_launch")
+				.with_description("Stops the running launched scene.")
+				.with_number_param("launch_id", "Optional launch identifier returned by launch_main_scene. Defaults to current active launch.", false)
+				.build();
+		server->register_tool(close_scene_launch_tool, [this](const mcp::json &p_params, const std::string &p_session_id) -> mcp::json {
+			(void)p_session_id;
+
+			int64_t launch_id = -1;
+			if (p_params.contains("launch_id")) {
+				if (!p_params["launch_id"].is_number_integer()) {
+					throw std::runtime_error("Parameter 'launch_id' must be an integer");
+				}
+				launch_id = p_params["launch_id"].get<int64_t>();
+			}
+
+			callable_mp(this, &MCPServerEditorPlugin::_perform_close_scene_launch).call_deferred(launch_id, false);
+
+			mcp::json result;
+			result["ok"] = true;
+			result["launch_id"] = launch_id;
+			result["status"] = "queued";
+			result["message"] = "Scene close request queued.";
+			return _make_text_result(result);
+		});
+
+		mcp::tool get_scene_launch_info_tool = mcp::tool_builder("get_scene_launch_info")
+				.with_description("Internal/debug tool. Returns launch bookkeeping and runtime metadata for a launch_id.")
+				.with_number_param("launch_id", "Identifier returned by launch_main_scene.", true)
+				.build();
+		server->register_tool(get_scene_launch_info_tool, [this](const mcp::json &p_params, const std::string &p_session_id) -> mcp::json {
+			(void)p_session_id;
+
+			if (!p_params.contains("launch_id") || !p_params["launch_id"].is_number_integer()) {
+				throw std::runtime_error("Missing required integer parameter: launch_id");
+			}
+			const int64_t launch_id = p_params["launch_id"].get<int64_t>();
+
+			LaunchRecord record;
+			{
+				MutexLock lock(launch_records_mutex);
+				if (!launch_records.has(launch_id)) {
+					throw std::runtime_error(vformat("Unknown launch_id: %d", launch_id).utf8().get_data());
+				}
+				record = launch_records[launch_id];
+			}
+
+			const EditorRunBar *run_bar = EditorRunBar::get_singleton();
+			const EditorDebuggerNode *debugger = EditorDebuggerNode::get_singleton();
+
+			const bool is_playing = run_bar != nullptr ? run_bar->is_playing() : false;
+			const int64_t current_process_id = run_bar != nullptr ? (int64_t)run_bar->get_current_process() : -1;
+			const String current_scene = run_bar != nullptr ? run_bar->get_playing_scene() : String();
+			const String current_debugger_uri = debugger != nullptr ? debugger->get_server_uri() : String();
+
+			mcp::json result;
+			result["ok"] = true;
+			result["launch_id"] = launch_id;
+			result["launch_requested"] = record.launch_requested;
+			result["launch_completed"] = record.launch_completed;
+			result["launch_succeeded"] = record.launch_succeeded;
+			result["closed"] = record.closed;
+			result["closed_by_timeout"] = record.closed_by_timeout;
+			result["launched_headless"] = record.launched_headless;
+			result["timeout_sec"] = record.timeout_sec;
+			result["timeout_deadline_msec"] = record.timeout_deadline_msec;
+			result["error"] = record.error.utf8().get_data();
+			result["scene_path"] = record.scene_path.utf8().get_data();
+			result["debugger_uri"] = record.debugger_uri.utf8().get_data();
+			result["process_id"] = record.process_id;
+			result["runtime"] = {
+				{ "is_playing", is_playing },
+				{ "current_process_id", current_process_id },
+				{ "current_scene_path", current_scene.utf8().get_data() },
+				{ "current_debugger_uri", current_debugger_uri.utf8().get_data() },
+				{ "matches_recorded_process", (record.process_id >= 0 && record.process_id == current_process_id) },
+			};
+			return _make_text_result(result);
+		});
 
 		if (server->start(false)) {
 			started = true;
