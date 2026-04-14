@@ -145,6 +145,10 @@ Files extracted from upstream source:
 - `common/`, `include/`, and `src/` folders
 - `LICENSE`
 
+Patches:
+
+- `0001-disable-so-reuseport.patch`
+
 
 ## cvtt
 

@@ -39,6 +39,23 @@ server::server(const server::configuration& conf)
     #else
      http_server_ = std::make_unique<httplib::Server>();
     #endif
+
+    // Avoid SO_REUSEPORT so separate editor instances cannot share the same MCP port.
+    // Keep SO_REUSEADDR enabled for normal restart behavior.
+    http_server_->set_socket_options([](auto sock) {
+        int optval = 1;
+        setsockopt(
+            sock,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+#ifdef _WIN32
+            reinterpret_cast<const char *>(&optval),
+#else
+            &optval,
+#endif
+            sizeof(optval)
+        );
+    });
 }
 
 server::~server() {
