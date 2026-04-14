@@ -37,6 +37,7 @@
 #include "core/version.h"
 #include "editor/editor_log.h"
 #include "editor/editor_node.h"
+#include "editor/file_system/editor_paths.h"
 #include "editor/settings/editor_settings.h"
 #include "modules/modules_enabled.gen.h"
 #include "mcp_server.h"
@@ -238,7 +239,8 @@ void MCPServerEditorPlugin::_read_settings() {
 }
 
 void MCPServerEditorPlugin::_save_discovered_port(int p_port) {
-	const String mcp_port_path = ProjectSettings::get_singleton()->get_project_data_path().path_join("mcp_port");
+	const String mcp_port_dir = EditorPaths::get_singleton()->get_project_settings_dir();
+	const String mcp_port_path = mcp_port_dir.path_join("mcp_port");
 
 	if (p_port < 0) {
 		if (FileAccess::exists(mcp_port_path)) {
@@ -247,6 +249,12 @@ void MCPServerEditorPlugin::_save_discovered_port(int p_port) {
 				EditorNode::get_log()->add_message(vformat("Cannot remove MCP port file %s.", mcp_port_path), EditorLog::MSG_TYPE_WARNING);
 			}
 		}
+		return;
+	}
+
+	const Error mkdir_err = DirAccess::make_dir_recursive_absolute(ProjectSettings::get_singleton()->globalize_path(mcp_port_dir));
+	if (mkdir_err != OK) {
+		EditorNode::get_log()->add_message(vformat("Cannot create MCP port directory %s.", mcp_port_dir), EditorLog::MSG_TYPE_WARNING);
 		return;
 	}
 
