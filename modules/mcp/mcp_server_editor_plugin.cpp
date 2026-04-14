@@ -33,11 +33,18 @@
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/object/message_queue.h"
+#include "core/os/mutex.h"
+#include "core/os/semaphore.h"
+#include "core/os/thread.h"
 #include "core/string/print_string.h"
 #include "core/version.h"
 #include "editor/editor_log.h"
+#include "editor/editor_main_screen.h"
 #include "editor/editor_node.h"
 #include "editor/file_system/editor_paths.h"
+#include "editor/scene/3d/node_3d_editor_plugin.h"
+#include "editor/scene/canvas_item_editor_plugin.h"
 #include "editor/settings/editor_settings.h"
 #include "modules/modules_enabled.gen.h"
 #include "mcp_server.h"
@@ -198,6 +205,210 @@ static mcp::json _check_script_tool_handler(const mcp::json &p_params, const std
 #endif
 }
 
+static Mutex _screenshot_capture_mutex;
+static Semaphore _screenshot_capture_semaphore;
+static String _screenshot_capture_requested_viewport;
+static String _screenshot_capture_resolved_viewport;
+static String _screenshot_capture_error;
+static Ref<Image> _screenshot_capture_image;
+
+static Ref<Image> _capture_2d_editor_viewport_image() {
+	CanvasItemEditor *canvas_item_editor = CanvasItemEditor::get_singleton();
+	if (canvas_item_editor == nullptr) {
+		return Ref<Image>();
+	}
+
+	Control *viewport_control = canvas_item_editor->get_viewport_control();
+	if (viewport_control == nullptr || !viewport_control->is_visible_in_tree()) {
+		return Ref<Image>();
+	}
+
+	Viewport *viewport = viewport_control->get_viewport();
+	if (viewport == nullptr) {
+		return Ref<Image>();
+	}
+
+	Ref<ViewportTexture> texture = viewport->get_texture();
+	if (texture.is_null()) {
+		return Ref<Image>();
+	}
+
+	Ref<Image> image = texture->get_image();
+	if (image.is_null() || image->is_empty()) {
+		return Ref<Image>();
+	}
+
+	const Rect2 global_rect = viewport_control->get_global_rect();
+	Rect2i crop_rect = Rect2i(global_rect);
+	crop_rect = crop_rect.intersection(Rect2i(Point2i(), image->get_size()));
+	if (crop_rect.size.x <= 0 || crop_rect.size.y <= 0) {
+		return Ref<Image>();
+	}
+
+	return image->get_region(crop_rect);
+}
+
+static Ref<Image> _capture_3d_editor_viewport_image() {
+	Node3DEditor *node_3d_editor = Node3DEditor::get_singleton();
+	if (node_3d_editor == nullptr) {
+		return Ref<Image>();
+	}
+
+	Node3DEditorViewport *editor_viewport = node_3d_editor->get_last_used_viewport();
+	if (editor_viewport == nullptr) {
+		editor_viewport = node_3d_editor->get_editor_viewport(0);
+	}
+	if (editor_viewport == nullptr) {
+		return Ref<Image>();
+	}
+
+	SubViewport *viewport = editor_viewport->get_viewport_node();
+	if (viewport == nullptr) {
+		return Ref<Image>();
+	}
+
+	Ref<ViewportTexture> texture = viewport->get_texture();
+	if (texture.is_null()) {
+		return Ref<Image>();
+	}
+
+	Ref<Image> image = texture->get_image();
+	if (image.is_null() || image->is_empty()) {
+		return Ref<Image>();
+	}
+
+	return image;
+}
+
+static Ref<Image> _capture_editor_viewport_image_main_thread(const String &p_viewport_target, String &r_resolved_viewport_target, String &r_error) {
+	ERR_FAIL_COND_V_MSG(!Thread::is_main_thread(), Ref<Image>(), "Editor viewport capture must run on the main thread.");
+
+	String resolved_viewport_target = p_viewport_target;
+	if (resolved_viewport_target == "current") {
+		EditorMainScreen *main_screen = EditorNode::get_editor_main_screen();
+		if (main_screen == nullptr) {
+			r_error = "Editor main screen is not available";
+			return Ref<Image>();
+		}
+
+		const int selected_screen = main_screen->get_selected_index();
+		if (selected_screen == EditorMainScreen::EDITOR_2D) {
+			resolved_viewport_target = "2d";
+		} else if (selected_screen == EditorMainScreen::EDITOR_3D) {
+			resolved_viewport_target = "3d";
+		} else {
+			r_error = "Current editor screen is neither 2D nor 3D. Specify viewport as '2d' or '3d'.";
+			return Ref<Image>();
+		}
+	}
+
+	Ref<Image> image;
+	if (resolved_viewport_target == "2d") {
+		image = _capture_2d_editor_viewport_image();
+	} else if (resolved_viewport_target == "3d") {
+		image = _capture_3d_editor_viewport_image();
+	} else {
+		r_error = "Parameter 'viewport' must be one of: '2d', '3d', 'current'";
+		return Ref<Image>();
+	}
+
+	if (image.is_null() || image->is_empty()) {
+		r_error = vformat("Failed to capture %s editor viewport image.", resolved_viewport_target);
+		return Ref<Image>();
+	}
+
+	r_resolved_viewport_target = resolved_viewport_target;
+	return image;
+}
+
+static void _capture_editor_viewport_image_deferred() {
+	_screenshot_capture_error = String();
+	_screenshot_capture_resolved_viewport = String();
+	_screenshot_capture_image.unref();
+
+	_screenshot_capture_image = _capture_editor_viewport_image_main_thread(
+			_screenshot_capture_requested_viewport,
+			_screenshot_capture_resolved_viewport,
+			_screenshot_capture_error);
+	_screenshot_capture_semaphore.post();
+}
+
+static Ref<Image> _capture_editor_viewport_image_thread_safe(const String &p_viewport_target, String &r_resolved_viewport_target, String &r_error) {
+	if (Thread::is_main_thread()) {
+		return _capture_editor_viewport_image_main_thread(p_viewport_target, r_resolved_viewport_target, r_error);
+	}
+
+	MutexLock lock(_screenshot_capture_mutex);
+	_screenshot_capture_requested_viewport = p_viewport_target;
+
+	CallQueue *main_message_queue = MessageQueue::get_main_singleton();
+	if (main_message_queue == nullptr) {
+		r_error = "Main message queue is unavailable";
+		return Ref<Image>();
+	}
+
+	main_message_queue->push_callable(callable_mp_static(&_capture_editor_viewport_image_deferred));
+	_screenshot_capture_semaphore.wait();
+
+	r_error = _screenshot_capture_error;
+	r_resolved_viewport_target = _screenshot_capture_resolved_viewport;
+	return _screenshot_capture_image;
+}
+
+static mcp::json _screenshot_viewport_tool_handler(const mcp::json &p_params, const std::string &) {
+	if (!p_params.contains("path") || !p_params["path"].is_string()) {
+		throw std::runtime_error("Missing required string parameter: path");
+	}
+
+	String viewport_target = "current";
+	if (p_params.contains("viewport")) {
+		if (!p_params["viewport"].is_string()) {
+			throw std::runtime_error("Parameter 'viewport' must be a string");
+		}
+		viewport_target = String::utf8(p_params["viewport"].get<std::string>().c_str()).strip_edges().to_lower();
+	}
+
+	String screenshot_path = String::utf8(p_params["path"].get<std::string>().c_str()).strip_edges();
+	if (screenshot_path.is_empty()) {
+		throw std::runtime_error("Parameter 'path' must not be empty");
+	}
+	if (!screenshot_path.is_absolute_path()) {
+		throw std::runtime_error("Parameter 'path' must be an absolute filesystem path");
+	}
+	if (screenshot_path.get_extension().to_lower() != "png") {
+		throw std::runtime_error("Only PNG output is supported. Path must end with .png");
+	}
+
+	String resolved_viewport_target;
+	String capture_error;
+	Ref<Image> image = _capture_editor_viewport_image_thread_safe(viewport_target, resolved_viewport_target, capture_error);
+	if (image.is_null() || image->is_empty()) {
+		if (capture_error.is_empty()) {
+			capture_error = "Unknown editor viewport capture error";
+		}
+		throw std::runtime_error(capture_error.utf8().get_data());
+	}
+
+	const Error save_error = image->save_png(screenshot_path);
+	if (save_error != OK) {
+		throw std::runtime_error(vformat("Cannot save screenshot to '%s' (error %d).", screenshot_path, save_error).utf8().get_data());
+	}
+
+	mcp::json result;
+	result["ok"] = true;
+	result["path"] = screenshot_path.utf8().get_data();
+	result["viewport"] = resolved_viewport_target.utf8().get_data();
+	result["width"] = image->get_width();
+	result["height"] = image->get_height();
+
+	return {
+		{
+			{"type", "text"},
+			{"text", result.dump()},
+		},
+	};
+}
+
 #ifdef TESTS_ENABLED
 Dictionary mcp_check_script_tool_handler_for_tests(const String &p_path, bool p_include_warnings) {
 	Dictionary result;
@@ -333,6 +544,13 @@ void MCPServerEditorPlugin::start() {
 				.with_boolean_param("include_warnings", "Include parser/analyzer warnings in the output.", false)
 				.build();
 		server->register_tool(check_script_tool, _check_script_tool_handler);
+
+		mcp::tool screenshot_viewport_tool = mcp::tool_builder("screenshot_viewport")
+				.with_description("Capture the editor 2D or 3D viewport and save it as a PNG file.")
+				.with_string_param("path", "Absolute output path ending with .png.", true)
+				.with_string_param("viewport", "Viewport target: '2d', '3d', or 'current' (default).", false)
+				.build();
+		server->register_tool(screenshot_viewport_tool, _screenshot_viewport_tool_handler);
 
 		if (server->start(false)) {
 			started = true;
