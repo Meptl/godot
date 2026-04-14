@@ -109,8 +109,24 @@ bool server::start(bool blocking) {
         LOG_INFO(req.remote_addr, ":", req.remote_port, " - \"DELETE ", req.path, " HTTP/1.1\" ", res.status);
     });
     
-    // Start resource check thread (only start in non-blocking mode)
-    if (!blocking) {
+    // Start server
+    if (blocking) {
+        running_ = true;
+        LOG_INFO("Starting server in blocking mode");
+        if (!http_server_->listen(host_.c_str(), port_)) {
+            running_ = false;
+            LOG_ERROR("Failed to start server on ", host_, ":", port_);
+            return false;
+        }
+        return true;
+    } else {
+        // Try to bind synchronously so start(false) accurately reports failures.
+        if (!http_server_->bind_to_port(host_.c_str(), port_)) {
+            LOG_ERROR("Failed to start server on ", host_, ":", port_);
+            return false;
+        }
+
+        // Start resource check thread (only start in non-blocking mode)
         maintenance_thread_run_ = true;
         maintenance_thread_ = std::make_unique<std::thread>([this]() {
             while (true) {
@@ -134,23 +150,11 @@ bool server::start(bool blocking) {
                 }
             }
         });
-    }
-    
-    // Start server
-    if (blocking) {
-        running_ = true;
-        LOG_INFO("Starting server in blocking mode");
-        if (!http_server_->listen(host_.c_str(), port_)) {
-            running_ = false;
-            LOG_ERROR("Failed to start server on ", host_, ":", port_);
-            return false;
-        }
-        return true;
-    } else {
+
         // Start server in a separate thread
         server_thread_ = std::make_unique<std::thread>([this]() {
             LOG_INFO("Starting server in separate thread");
-            if (!http_server_->listen(host_.c_str(), port_)) {
+            if (!http_server_->listen_after_bind()) {
                 LOG_ERROR("Failed to start server on ", host_, ":", port_);
                 running_ = false;
                 return;
