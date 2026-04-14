@@ -347,10 +347,7 @@ void MCPServerEditorPlugin::start() {
 			break;
 		}
 
-		int last_port = bind_port++;
-		const String retry_msg = vformat("Cannot listen on port %d, trying %d instead.", last_port, bind_port);
-		EditorNode::get_log()->add_message(retry_msg, EditorLog::MSG_TYPE_WARNING);
-		print_line(retry_msg);
+		bind_port++;
 	}
 }
 
