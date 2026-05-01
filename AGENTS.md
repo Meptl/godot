@@ -59,3 +59,6 @@ echo "$LAUNCH_TEXT"
 
 Important:
 - `notifications/initialized` is required after `initialize`. Without it, `tools/list` and `tools/call` will fail with `Session not initialized`.
+
+## Unit test
+bin/godot.linuxbsd.editor.x86_64.llvm --test --test-case="[MCP]*" --test-verbose
